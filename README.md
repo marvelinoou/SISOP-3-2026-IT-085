@@ -12,30 +12,135 @@
 
 Program ini mengimplementasikan chat server bernama **The Wired** menggunakan TCP Socket. Ada dua program yang dibuat: server (`wired.c`) dan client (`navi.c`), dengan shared definitions di `protocol.h` dan `protocol.c`.
 
-Server menggunakan `select()` untuk I/O multiplexing, artinya satu thread bisa memantau semua koneksi client sekaligus tanpa harus fork atau bikin thread baru per client. Cara kerjanya: `select()` nunggu sampai ada fd yang aktif, kalau ada koneksi baru masuk maka `accept()`, kalau ada pesan dari client yang udah konek maka `recv()` dan proses. Pendekatan ini jauh lebih efisien dibanding fork per client karena tidak ada overhead pembuatan proses baru.
+**protocol.h** berfungsi sebagai file shared yang dipake bareng wired.c dan navi.c. Isinya konstanta koneksi, konstanta admin, dan prototype fungsi logging.
 
-Setiap client yang konek punya state machine sendiri dengan empat tahap:
-- `STATE_WAIT_NAME` — client baru masuk, server minta nama
-- `STATE_WAIT_PASS` — kalau namanya "The Knights", server minta password
-- `STATE_CONNECTED` — client normal yang bisa chat
-- `STATE_ADMIN` — client admin yang bisa akses menu RPC
+```c
+#define PORT 8080
+#define ADMIN_NAME "The Knights"
+#define ADMIN_PASSWORD "protocol7"
+#define LOG_FILE "history.log"
 
-Pengecekan nama dilakukan sebelum client masuk ke state CONNECTED. Kalau nama sudah dipakai client lain, server langsung tolak dan minta nama lain. Ini dijamin lewat fungsi `name_taken()` yang loop semua client aktif. State machine ini penting supaya server tahu harus ngapain dengan setiap pesan yang masuk — apakah diperlakukan sebagai nama, password, chat, atau pilihan menu admin.
+void write_log(const char *level, const char *message);
+```
 
-Setiap pesan dari client yang sudah CONNECTED akan di-broadcast ke semua client lain yang juga CONNECTED, kecuali pengirimnya sendiri. Admin tidak ikut menerima broadcast karena statenya berbeda. Broadcast dilakukan lewat fungsi `broadcast()` yang loop semua slot client dan kirim pesan ke yang memenuhi syarat.
+**protocol.c** berisi implementasi `write_log` untuk logging ke `history.log` sesuai poin 7. File dibuka mode append supaya log tidak pernah ketimpa.
 
-Client admin "The Knights" dengan password "protocol7" punya akses ke tiga fungsi RPC lewat menu khusus:
-1. Check Active Entities — lihat siapa aja yang lagi online beserta jumlahnya
-2. Check Server Uptime — lihat sudah berapa lama server jalan dalam format jam/menit/detik
-3. Execute Emergency Shutdown — matikan server secara paksa dan disconnect semua client yang sedang terhubung
+```c
+void write_log(const char *level, const char *message) {
+    FILE *f = fopen(LOG_FILE, "a");
+    if (!f) return;
 
-Di sisi client, `navi.c` menggunakan dua pthread yang jalan paralel supaya bisa recv dan send sekaligus tanpa saling blocking. Tanpa thread, kalau program nunggu input keyboard maka tidak bisa terima pesan dari server, dan sebaliknya. Dengan dua thread masalah ini selesai:
-- Main thread: baca input keyboard lewat `fgets()`, kirim ke server via `send()`
-- recv_thread: terus-menerus `recv()` dari server, langsung print ke layar
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", t);
 
-Kalau koneksi terputus dari sisi server (misalnya admin trigger shutdown), recv_thread mendeteksi `recv()` return 0 atau negatif, lalu program otomatis exit. Signal `SIGINT` juga dihandle supaya kalau user tekan Ctrl+C, client kirim `/exit` dulu ke server sebelum tutup koneksi.
+    fprintf(f, "[%s] [%s] [%s]\n", timestamp, level, message);
+    fclose(f);
+}
+```
 
-Semua event dicatat ke `history.log` lewat fungsi `write_log()` di `protocol.c` dengan format `[YYYY-MM-DD HH:MM:SS] [System/Admin/User] [pesan]`. File log dibuka dengan mode append setiap kali ada event, jadi history tidak pernah terhapus selama file-nya masih ada.
+**wired.c** adalah server yang menggunakan `select()` untuk I/O multiplexing sesuai poin 3, sehingga satu thread bisa handle banyak client sekaligus tanpa fork. Setiap client punya state machine sendiri dengan empat tahap:
+
+```c
+#define STATE_WAIT_NAME 0
+#define STATE_WAIT_PASS 1
+#define STATE_CONNECTED 2
+#define STATE_ADMIN     3
+```
+
+Switch berikut yang menentukan handler mana yang dipanggil berdasarkan state client:
+
+```c
+switch (clients[idx].state) {
+    case STATE_WAIT_NAME: handle_wait_name(idx, buf); break;
+    case STATE_WAIT_PASS: handle_wait_pass(idx, buf); break;
+    case STATE_CONNECTED: handle_connected(idx, buf); break;
+    case STATE_ADMIN:     handle_admin(idx, buf);     break;
+}
+```
+
+Fungsi `broadcast` mengimplementasikan poin 5, mengirim pesan ke semua client CONNECTED kecuali pengirimnya sendiri:
+
+```c
+static void broadcast(const char *msg, int exclude_fd) {
+    for (int i = 0; i < n_clients; i++) {
+        if (clients[i].fd != exclude_fd && clients[i].state == STATE_CONNECTED)
+            send_msg(clients[i].fd, msg);
+    }
+}
+```
+
+Fungsi `name_taken` mengimplementasikan poin 4, memastikan nama setiap client unik:
+
+```c
+static int name_taken(const char *name) {
+    for (int i = 0; i < n_clients; i++)
+        if (strcmp(clients[i].name, name) == 0) return 1;
+    return 0;
+}
+```
+
+Handler admin sesuai poin 6, jika nama yang masuk adalah `The Knights` maka server minta password. Kalau salah langsung disconnect:
+
+```c
+if (strcmp(buf, ADMIN_NAME) == 0) {
+    clients[idx].state = STATE_WAIT_PASS;
+    send_msg(fd, "Enter Password: ");
+}
+
+// kalau password salah
+send_msg(fd, "[System] Authentication Failed.\n");
+remove_client(idx);
+```
+
+Main loop server menggunakan `select()` untuk memantau semua fd sekaligus:
+
+```c
+while (1) {
+    fd_set read_fds = master_fds;
+    if (select(max_fd + 1, &read_fds, NULL, NULL, NULL) < 0) continue;
+
+    for (int fd = 0; fd <= max_fd; fd++) {
+        if (!FD_ISSET(fd, &read_fds)) continue;
+
+        if (fd == server_fd) {
+            int new_fd = accept(server_fd, ...);
+            FD_SET(new_fd, &master_fds);
+        } else {
+            int n = recv(fd, buf, sizeof(buf) - 1, 0);
+            if (n <= 0) { handle_disconnect(idx); continue; }
+            switch (clients[idx].state) { ... }
+        }
+    }
+}
+```
+
+**navi.c** adalah client yang menggunakan dua pthread sesuai poin 2. Main thread baca input keyboard dan send ke server, recv_thread terus recv dari server dan print ke layar:
+
+```c
+pthread_t tid;
+int err = pthread_create(&tid, NULL, recv_thread, NULL);
+if (err != 0) {
+    printf("\nThread can't be created : [%s]", strerror(err));
+    return -1;
+}
+pthread_detach(tid);
+```
+
+Kalau server disconnect, recv_thread mendeteksi dan program exit:
+
+```c
+static void *recv_thread(void *arg) {
+    while (running) {
+        int n = recv(sock_fd, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) { running = 0; exit(0); }
+        printf("%s", buf);
+        fflush(stdout);
+    }
+    return NULL;
+}
+```
 
 ### Cara Penggunaan
 
@@ -51,9 +156,43 @@ gcc navi.c protocol.c -o navi -pthread
 ./navi
 ```
 
+### Output
+
+1. Server berhasil dijalankan (poin 1 - koneksi stabil lewat PORT yang didefinisikan di protocol.h)
+
+![server running](assets/soal1/server_running.png)
+
+2. Client konek dan muncul welcome message (poin 2 - client NAVI berhasil terhubung ke server)
+
+![client connect](assets/soal1/client_connect.png)
+
+3. Broadcast pesan antar client (poin 5 - pesan dari alice muncul di terminal lain)
+
+![broadcast](assets/soal1/broadcast.png)
+
+4. Nama duplikat ditolak (poin 4 - identitas unik, tidak bisa ada dua client dengan nama sama)
+
+![duplicate name](assets/soal1/duplicate_name.png)
+
+5. Admin login berhasil dan muncul menu THE KNIGHTS CONSOLE (poin 6 - autentikasi admin)
+
+![admin login](assets/soal1/admin_login.png)
+
+6. Admin RPC check active users dan uptime (poin 6 - fungsi RPC GET_USERS dan GET_UPTIME)
+
+![admin rpc](assets/soal1/admin_rpc.png)
+
+7. Emergency shutdown memutus semua client (poin 6 - fungsi RPC SHUTDOWN)
+
+![admin shutdown](assets/soal1/admin_shutdown.png)
+
+8. Isi history.log dengan format timestamp (poin 7 - logging semua event)
+
+![history log](assets/soal1/history_log.png)
+
 ### Kendala
 
--
+Terdapat error kompilasi karena `SO_REUSEPORT` tidak tersedia di beberapa versi Linux/WSL. Solusinya menghapus `SO_REUSEPORT` dan hanya menggunakan `SO_REUSEADDR` pada `setsockopt`.
 
 ---
 
@@ -61,38 +200,229 @@ gcc navi.c protocol.c -o navi -pthread
 
 ### Penjelasan
 
-Program ini mengimplementasikan game RPG battle berbasis terminal bernama **Battle Eterion**. Ada dua program: server (`orion.c`) yang handle semua logika game, dan client (`eternal.c`) yang jadi antarmuka untuk player. Semua shared definitions ada di `arena.h`.
+Program ini mengimplementasikan game RPG battle berbasis terminal bernama **Battle Eterion**. Server (`orion.c`) menangani seluruh logika game, sementara client (`eternal.c`) menyediakan antarmuka pengguna. Semua definisi ada di `arena.h`. Komunikasi antara keduanya menggunakan IPC, bukan socket.
 
-Bedanya sama soal 1, komunikasi di sini bukan lewat TCP socket tapi lewat **IPC** — artinya hanya bisa dipakai di mesin yang sama (lokal). Ada tiga IPC yang dipakai sekaligus:
+**arena.h** berisi semua definisi yang dipake bareng orion dan eternal. Tiga IPC key sesuai poin 1:
 
-| IPC | Key | Fungsi |
-|-----|-----|--------|
-| Shared Memory | 0x00001234 | Menyimpan seluruh state game (data player, battle aktif, matchmaking queue) |
-| Message Queue | 0x00005678 | Komunikasi request-response antara eternal dan orion |
-| Semaphore | 0x00009012 | Proteksi akses shared memory dari race condition |
+```c
+#define SHM_KEY   0x00001234  // Shared Memory
+#define MSG_KEY   0x00005678  // Message Queue
+#define SEM_KEY   0x00009012  // Semaphore
+```
 
-**Routing pesan** dilakukan lewat `mtype` di message queue. Semua request dari eternal ke orion pakai `mtype = 1`. Orion balas ke eternal dengan `mtype = PID eternal`, jadi setiap eternal hanya ambil pesan yang memang ditujukan untuknya. Ini penting supaya balasan dari orion tidak keambil oleh eternal yang salah ketika banyak client konek sekaligus.
+Struct `Player` menyimpan semua data akun. Field persistent disave ke file, field runtime di-reset tiap orion restart:
 
-**Register dan Login** — data player disimpan secara persistent ke file `players.dat` pakai binary `fwrite`/`fread`. Setiap ada perubahan data (register, battle selesai, beli senjata) orion langsung panggil `save_players()`. Waktu orion restart, data dimuat ulang lewat `load_players()` dan semua runtime field seperti `active`, `in_battle`, dan `in_mm` di-reset ke 0. Username dijamin unik dan satu akun tidak bisa login di dua sesi sekaligus — dicek lewat field `active` di shared memory. Default stats setiap player baru adalah Gold 150, Level 1, XP 0.
+```c
+typedef struct {
+    char     username[64];
+    char     password[64];
+    int      gold, lvl, xp;
+    int      weapon_idx;
+    MatchEntry history[MAX_HISTORY];
+    int      history_count;
+    // Runtime fields
+    int      active;
+    pid_t    pid;
+    int      in_battle, in_mm, battle_idx;
+} Player;
+```
 
-**Matchmaking** — dijalankan oleh `mm_thread` yang berjalan di background dan cek antrian setiap detik. Kalau ada dua atau lebih player di antrian, dua yang pertama langsung dipertemukan dan dikeluarkan dari antrian. Kalau seorang player sudah nunggu 35 detik tanpa ketemu lawan, dia otomatis dipertemukan dengan bot. Bot dikendalikan oleh `bot_thread` tersendiri yang menyerang secara otomatis dengan interval acak antara 1 sampai 3 detik. Nama dan damage bot di-random tiap battle.
+Struct `Message` mengatur routing pesan lewat mtype sesuai poin 3. Request dari eternal ke orion pake mtype = 1, balasan dari orion ke eternal pake mtype = PID eternal:
 
-**Battle** — berjalan real-time dan asinkron, bukan turn-based. Kedua pihak bisa menyerang kapan saja tanpa harus menunggu giliran. Player tekan `a` untuk normal attack dan `u` untuk ultimate (hanya bisa kalau punya senjata). Ada cooldown 1 detik antar serangan yang dicek lewat timestamp serangan terakhir. Terminal di-set ke raw mode selama battle supaya input `a` dan `u` langsung terbaca tanpa perlu tekan Enter. Setelah battle selesai terminal di-restore ke normal. Di sisi client ada `battle_recv` thread yang terus dengerin update dari orion dan redraw layar battle secara real-time.
+```c
+typedef struct {
+    long   mtype;
+    int    req_type;
+    int    res_type;
+    pid_t  pid;
+    int    value;
+    char   username[64];
+    char   password[64];
+    char   data[256];
+} Message;
+```
 
-Formula stat yang digunakan:
+Semaphore helpers untuk proteksi shared memory sesuai additional notes soal:
 
-| Stat | Formula |
-|------|---------|
-| Damage | `BASE_DAMAGE + (total XP / 50) + bonus weapon` |
-| Health | `BASE_HEALTH + (total XP / 10)` |
-| Ultimate | `Total Damage * 3` |
-| Level | Naik setiap kelipatan 100 XP |
+```c
+static inline void sem_lock(int semid) {
+    struct sembuf sb = {0, -1, 0};
+    semop(semid, &sb, 1);
+}
 
-**Armory** — ada 5 senjata dengan harga dan bonus damage yang berbeda, mulai dari Wood Sword (100G, +5 dmg) sampai God Slayer (5000G, +150 dmg). Orion otomatis pakai senjata dengan damage tertinggi yang dimiliki player. Kalau player punya senjata, ultimate bisa digunakan saat battle.
+static inline void sem_unlock(int semid) {
+    struct sembuf sb = {0, 1, 0};
+    semop(semid, &sb, 1);
+}
+```
 
-**Match History** — setiap battle yang selesai dicatat di array `history` dalam struct `Player`, disimpan ke `players.dat`, dan bisa dilihat lewat menu History di eternal. History menampilkan waktu, nama lawan, hasil (WIN/LOSS), dan XP yang didapat.
+**orion.c** adalah server game. Fungsi `save_players` dan `load_players` handle persistent data sesuai poin 4. Sebelum disave, runtime field di-reset ke 0:
 
-Semua akses ke shared memory dilindungi oleh semaphore lewat `sem_lock()` dan `sem_unlock()` untuk mencegah race condition ketika banyak eternal konek sekaligus dan mengakses data player yang sama di waktu yang bersamaan.
+```c
+void save_players() {
+    FILE *f = fopen(PLAYER_FILE, "wb");
+    if (!f) return;
+    fwrite(&shm->player_count, sizeof(int), 1, f);
+    for (int i = 0; i < shm->player_count; i++) {
+        Player tmp = shm->players[i];
+        tmp.active = 0; tmp.in_battle = 0;
+        tmp.in_mm  = 0; tmp.pid = 0; tmp.battle_idx = -1;
+        fwrite(&tmp, sizeof(Player), 1, f);
+    }
+    fclose(f);
+}
+```
+
+Fungsi `h_register` membuat akun baru dengan default stats sesuai poin 4 dan 5:
+
+```c
+void h_register(Message *m) {
+    sem_lock(semid);
+    if (find_player(m->username) >= 0) {
+        sem_unlock(semid);
+        respond(m->pid, RES_GENERAL, 0, "Username already taken.");
+        return;
+    }
+    shm->players[i].gold = 150;
+    shm->players[i].lvl  = 1;
+    shm->players[i].xp   = 0;
+    shm->players[i].weapon_idx = -1;
+    save_players();
+    sem_unlock(semid);
+    respond(m->pid, RES_GENERAL, 1, "Account created!");
+}
+```
+
+Fungsi `h_login` cek password dan field active. Kalau sudah 1 berarti sedang login di tempat lain, tolak sesuai poin 4:
+
+```c
+if (shm->players[i].active) {
+    sem_unlock(semid);
+    respond(m->pid, RES_GENERAL, 0, "Account already logged in.");
+    return;
+}
+```
+
+Thread `mm_thread` jalan di background sesuai poin 6, cek antrian matchmaking setiap detik. Kalau ada dua player langsung dipertemukan, kalau sudah 35 detik sendirian lawan bot:
+
+```c
+void *mm_thread(void *arg) {
+    while (1) {
+        sleep(1);
+        sem_lock(semid);
+        if (shm->mm_count >= 2) {
+            start_battle(p1i, p2i, 0); // vs player
+        }
+        for (int i = 0; i < shm->mm_count; i++) {
+            if (now - shm->mm_join[i] >= MATCHMAKE_TIME) {
+                start_battle(p1i, -1, 1); // vs bot
+            }
+        }
+        sem_unlock(semid);
+    }
+}
+```
+
+Fungsi `h_attack` handle serangan sesuai poin 7. Cek cooldown lewat timestamp, kalau ultimate dan tidak punya senjata diabaikan, damage ultimate 3x:
+
+```c
+void h_attack(Message *m, int ultimate) {
+    time_t now   = time(NULL);
+    time_t *last = is_p1 ? &b->p1_atk : &b->p2_atk;
+    if (now - *last < ATTACK_CD) return;
+    *last = now;
+
+    int dmg = get_damage(atk);
+    if (ultimate) {
+        if (atk->weapon_idx < 0) return;
+        dmg *= 3;
+    }
+    broadcast_state(bi);
+    if (b->p1_hp <= 0 || b->p2_hp <= 0)
+        end_battle(bi, b->p2_hp <= 0);
+}
+```
+
+Fungsi `end_battle` update stats sesuai poin 8 dan catat ke history sesuai poin 10:
+
+```c
+void end_battle(int bi, int p1_won) {
+    p1->xp   += p1_won ? 50 : 15;
+    p1->gold += p1_won ? 120 : 30;
+    p1->lvl   = (p1->xp / 100) + 1;
+    // catat ke history
+    respond(p1->pid, RES_BATTLE_END, p1_won, p1_won ? "VICTORY" : "DEFEAT");
+    save_players();
+    b->active = 0;
+}
+```
+
+Fungsi `h_buy` handle beli senjata sesuai poin 9. Orion otomatis pakai senjata dengan bonus damage terbesar:
+
+```c
+void h_buy(Message *m) {
+    if (p->gold < WEAPONS[wi].price) {
+        respond(m->pid, RES_GENERAL, 0, "Not enough gold.");
+        return;
+    }
+    p->gold -= WEAPONS[wi].price;
+    if (p->weapon_idx < 0 || WEAPONS[wi].bonus_dmg > WEAPONS[p->weapon_idx].bonus_dmg)
+        p->weapon_idx = wi;
+    save_players();
+}
+```
+
+**eternal.c** adalah client game. Main eternal cek apakah orion jalan lewat message queue sesuai poin 2:
+
+```c
+msgid = msgget(MSG_KEY, 0666);
+if (msgid < 0) {
+    printf("Orion are you there?\n");
+    return 1;
+}
+send_req(REQ_PING, 0, NULL, NULL);
+if (recv_msg(&pm, 2) < 0 || !pm.value) {
+    printf("Orion are you there?\n");
+    return 1;
+}
+```
+
+Fungsi `do_battle` handle seluruh alur battle. Terminal di-set ke raw mode supaya input `a` dan `u` langsung terbaca tanpa Enter sesuai poin 7:
+
+```c
+set_raw();
+while (battle_active) {
+    char c = 0;
+    if (read(STDIN_FILENO, &c, 1) > 0) {
+        if (c == 'a')
+            send_req(REQ_ATTACK, (player_idx << 16) | battle_idx, NULL, NULL);
+        else if (c == 'u' && player_weapon >= 0)
+            send_req(REQ_ULTIMATE, (player_idx << 16) | battle_idx, NULL, NULL);
+    }
+}
+restore_term();
+```
+
+Thread `battle_recv` terus dengerin update dari orion dan redraw layar battle secara real-time:
+
+```c
+void *battle_recv(void *arg) {
+    while (battle_active) {
+        msgrcv(msgid, &m, MSGSIZE, (long)my_pid, 0);
+        if (m.res_type == RES_BATTLE_UPD) {
+            pthread_mutex_lock(&bmtx);
+            // parse HP dan log
+            pthread_mutex_unlock(&bmtx);
+            draw_battle();
+        } else if (m.res_type == RES_BATTLE_END) {
+            battle_result = m.value;
+            battle_active = 0;
+            break;
+        }
+    }
+    return NULL;
+}
+```
 
 ### Cara Penggunaan
 
@@ -110,6 +440,56 @@ make
 make clear_ipc
 ```
 
+### Output
+
+1. Eternal dijalankan tanpa orion (poin 2 - deteksi orion tidak berjalan)
+
+![orion not running](assets/soal2/orion_not_running.png)
+
+2. Orion berhasil dijalankan (poin 1 - server siap menerima koneksi)
+
+![orion running](assets/soal2/orion_running.png)
+
+3. Register akun baru berhasil (poin 4 - register dengan username unik)
+
+![register](assets/soal2/register.png)
+
+4. Register username yang sudah ada ditolak (poin 4 - username harus unik)
+
+![duplicate username](assets/soal2/duplicate_username.png)
+
+5. Login berhasil dan muncul profile dengan default stats (poin 4 dan 5 - login dan default Gold 150, Lvl 1, XP 0)
+
+![login](assets/soal2/login.png)
+
+6. Login akun yang sedang aktif ditolak (poin 4 - satu akun tidak bisa login dua kali)
+
+![double login](assets/soal2/double_login.png)
+
+7. Battle real-time antara dua player, HP berkurang di kedua sisi (poin 6 dan 7 - matchmaking dan battle asinkron)
+
+![battle pvp](assets/soal2/battle_pvp.png)
+
+8. Matchmaking countdown dan battle vs bot setelah 35 detik (poin 6 - matchmaking timeout lawan bot)
+
+![battle bot](assets/soal2/battle_bot.png)
+
+9. Menu armory dan beli senjata, gold berkurang (poin 9 - sistem persenjataan)
+
+![armory](assets/soal2/armory.png)
+
+10. Ultimate saat battle dengan damage 3x (poin 7 - ultimate hanya bisa kalau punya senjata)
+
+![ultimate](assets/soal2/ultimate.png)
+
+11. Riwayat battle dengan timestamp, lawan, hasil, dan XP (poin 10 - match history)
+
+![history](assets/soal2/history.png)
+
+12. Orion direstart tapi stats player tetap sama (poin 4 - data persistent)
+
+![persistent](assets/soal2/persistent.png)
+
 ### Kendala
 
--
+Pengelolaan terminal saat battle memerlukan perhatian khusus karena raw mode harus di-restore setelah battle selesai. Sinkronisasi antara `battle_recv` thread dan main thread memerlukan `pthread_mutex` agar tidak terjadi race condition saat redraw layar battle. Untuk IPC, kalau orion di-kill paksa tanpa Ctrl+C, shared memory dan message queue bisa nyangkut di sistem dan perlu dibersihkan dengan `make clear_ipc`.
